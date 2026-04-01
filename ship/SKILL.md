@@ -1,6 +1,6 @@
 ---
 name: ship
-description: Use this skill when the user wants to ship work via a Pull Request and automatically return the repository to its original clean state. Trigger when the user says "ship", "ship it", "ship this PR", "create a PR and cleanup", "done with this branch", "push and go back to main", "finalize this feature", or any variation of wanting to open a PR and restore the workspace — whether they're on a regular branch or inside a git worktree. Always use this skill instead of manually creating PRs when cleanup is expected afterward.
+description: Use this skill when the user wants to ship work via a Pull Request and automatically return the repository to its original clean state. Trigger when the user says "ship", "ship it", "ship this PR", "create a PR and cleanup", "done with this branch", "push and go back", "finalize this feature", or any variation of wanting to open a PR and restore the workspace — whether they're on a regular branch or inside a git worktree. Always use this skill instead of manually creating PRs when cleanup is expected afterward.
 ---
 
 # Ship
@@ -38,6 +38,7 @@ From `git worktree list`, the **first line** is always the main worktree.
 Capture and store:
 - `CURRENT_BRANCH`: output of `git branch --show-current`
 - `MAIN_WORKTREE_PATH`: first path from `git worktree list`
+- `MAIN_WORKTREE_BRANCH`: branch checked out in the main worktree (from `git worktree list | head -1`, the part inside `[...]`)
 - `CURRENT_WORKTREE_PATH`: output of `git rev-parse --show-toplevel` (only relevant if in worktree context)
 - `IS_WORKTREE`: boolean
 
@@ -98,23 +99,51 @@ Stop.
 
 **If tests pass:** Continue silently.
 
-## Step 4: Determine Base Branch
+## Step 4: Detect Origin Branch
 
+The origin branch is **where the current branch was created from** — not necessarily `main`. This is what the PR will target and where the workspace will return to.
+
+Detection strategy (run in order, use the first result that makes sense):
+
+**For worktrees** — the main worktree's branch is the strongest signal, since worktrees are almost always created from it:
 ```bash
-# Try to detect the remote default branch
-BASE=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
+ORIGIN_BRANCH=$(git worktree list | head -1 | grep -oP '\[\K[^\]]+')
+```
 
-# Fallback: check common names
-if [ -z "$BASE" ]; then
-  git fetch origin --quiet 2>/dev/null
-  BASE=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
+**For regular branches** — find the local branch with the smallest number of unique commits relative to HEAD (i.e., where this branch most recently diverged from):
+```bash
+# Collect candidates: common base branches + any local branch
+CANDIDATES=$(git for-each-ref --format='%(refname:short)' refs/heads/ | grep -v "^$(git branch --show-current)$")
+BEST=""
+BEST_AHEAD=999999
+for candidate in $CANDIDATES; do
+  ahead=$(git rev-list --count "$candidate"..HEAD 2>/dev/null || echo 999999)
+  if [ "$ahead" -lt "$BEST_AHEAD" ]; then
+    BEST_AHEAD=$ahead
+    BEST=$candidate
+  fi
+done
+ORIGIN_BRANCH=$BEST
+```
+
+**Fallback** — if no local candidate found, fall back to the remote default branch:
+```bash
+if [ -z "$ORIGIN_BRANCH" ]; then
+  ORIGIN_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
 fi
 
-# Last resort fallback
-if [ -z "$BASE" ]; then
-  BASE="main"
+# Last resort
+if [ -z "$ORIGIN_BRANCH" ]; then
+  ORIGIN_BRANCH="main"
 fi
 ```
+
+**Confirm with the user** if uncertain:
+```
+Detected origin branch: <ORIGIN_BRANCH> (<N> commits behind HEAD).
+Is this correct, or should I target a different branch?
+```
+Only ask if confidence is low — e.g., multiple candidates with the same distance, or fallback was used.
 
 ## Step 5: Push and Create PR
 
@@ -125,11 +154,12 @@ git push -u origin "$CURRENT_BRANCH"
 
 Build the PR title from the branch name: strip common prefixes (`feat/`, `fix/`, `feature/`, `chore/`, `refactor/`, `hotfix/`), replace hyphens with spaces, capitalize. Cross-reference with recent commits to make it human-readable.
 
-Build the PR body from `git log $BASE..HEAD` and `git diff $BASE...HEAD --stat`:
+Build the PR body from `git log $ORIGIN_BRANCH..HEAD` and `git diff $ORIGIN_BRANCH...HEAD --stat`:
 
 ```bash
 gh pr create \
   --title "<derived title>" \
+  --base "$ORIGIN_BRANCH" \
   --body "$(cat <<'EOF'
 ## Summary
 <2-3 bullets summarizing what changed, derived from commits and diff>
@@ -152,35 +182,39 @@ Print the PR URL prominently after creation.
 git worktree remove "$CURRENT_WORKTREE_PATH"
 ```
 
-Since you cannot change the user's shell working directory, **always print explicit instructions**:
+Since you cannot change the user's shell working directory, **always print explicit instructions** to return to the origin branch:
 
 ```
 PR created: <URL>
 
-Worktree removed. Switch back to your main workspace:
+Worktree removed. Return to your origin branch:
 
   cd <MAIN_WORKTREE_PATH>
+  git checkout <ORIGIN_BRANCH>   # (only if main worktree isn't already on it)
+  git pull
 ```
+
+If `MAIN_WORKTREE_BRANCH` already equals `ORIGIN_BRANCH`, omit the `git checkout` line.
 
 ### If on a Regular Branch
 
 ```bash
-git checkout "$BASE"
+git checkout "$ORIGIN_BRANCH"
 git pull
 ```
 
 Report:
 ```
 PR created: <URL>
-Switched to <base-branch> and pulled latest.
+Switched to <ORIGIN_BRANCH> and pulled latest.
 ```
 
 ## Quick Reference
 
 | Context | After PR created |
 |---------|-----------------|
-| Worktree | `git worktree remove <path>` + instruct `cd` to main |
-| Regular branch | `git checkout <base> && git pull` |
+| Worktree | `git worktree remove <path>` + instruct `cd` to main worktree + `git checkout <ORIGIN_BRANCH> && git pull` |
+| Regular branch | `git checkout <ORIGIN_BRANCH> && git pull` |
 
 ## Edge Cases
 
@@ -202,11 +236,13 @@ In this case, just print the existing PR URL and proceed to cleanup.
 - Ship with failing tests
 - Force-push without the user explicitly asking
 - Delete uncommitted changes without confirmation
-- Assume the base branch name without detecting it
+- Assume the origin branch is always `main` — detect it properly
+- Target the wrong base on `gh pr create` (always pass `--base "$ORIGIN_BRANCH"`)
 
 **Always:**
 - Detect worktree vs. regular branch before acting
-- Pull latest on base branch after switching (regular branch case)
+- Pull latest on origin branch after switching
 - Print the PR URL clearly after creation
-- Give explicit `cd` instructions when removing a worktree — you cannot change the user's shell CWD
+- Give explicit `cd` + `git checkout` instructions when removing a worktree — you cannot change the user's shell CWD
 - Remind the user if a stash was created during Step 2
+- Confirm the detected origin branch with the user when confidence is low
