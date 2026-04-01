@@ -1,6 +1,6 @@
 ---
 name: ship
-description: Use this skill when the user wants to ship work via a Pull Request and automatically return the repository to its original clean state. Trigger when the user says "ship", "ship it", "ship this PR", "create a PR and cleanup", "done with this branch", "push and go back", "finalize this feature", or any variation of wanting to open a PR and restore the workspace — whether they're on a regular branch or inside a git worktree. Always use this skill instead of manually creating PRs when cleanup is expected afterward.
+description: Use this skill when the user wants to ship work via a Pull Request and automatically return the repository to its original clean state. Trigger when the user says "ship", "ship it", "ship this PR", "create a PR and cleanup", "done with this branch", "push and go back", "finalize this feature", or any variation of wanting to open a PR and restore the workspace — whether they're on a regular branch, inside a git worktree, or working across multiple independent repos in a monorepo-style parent directory. Always use this skill instead of manually creating PRs when cleanup is expected afterward.
 ---
 
 # Ship
@@ -14,35 +14,99 @@ Ship the current work via a Pull Request and restore the repository to its origi
 This skill is opinionated and streamlined: it always ships via PR and always restores the repository afterward. No menu, no options — just push, PR, and return to clean state.
 
 The full flow:
-1. Detect context (worktree or regular branch)
-2. Handle uncommitted changes
-3. Verify tests pass
-4. Push and create PR
-5. Restore original state
+1. Detect context (worktree, single repo, or multi-repo parent)
+2. [Multi-repo] Discover all affected sibling repos and iterate Steps 3–6 for each
+3. Handle uncommitted changes
+4. Verify tests pass
+5. Push and create PR
+6. Restore original state
+7. [Multi-repo] Summarize all PRs
+
+---
 
 ## Step 1: Detect Context
 
-Run both commands and capture the output:
+Run these commands and capture the output:
 
 ```bash
-git worktree list
-git rev-parse --show-toplevel
-git branch --show-current
+git worktree list 2>/dev/null
+git rev-parse --show-toplevel 2>/dev/null
+git branch --show-current 2>/dev/null
 ```
 
-From `git worktree list`, the **first line** is always the main worktree.
+**Three possible contexts:**
 
-- **Worktree context**: current path (`show-toplevel`) matches a line other than the first in `worktree list`
-- **Regular branch context**: current path is the main worktree path (first line)
+### A) Worktree context
+Current path matches a non-first line in `git worktree list`. Proceed with single-repo flow (Steps 3–6) inside this worktree.
 
-Capture and store:
+### B) Regular single-repo branch
+Current path is the main worktree path (first line of `worktree list`). Proceed with single-repo flow (Steps 3–6).
+
+### C) Multi-repo parent (no git root here, but subdirs are independent repos)
+`git rev-parse --show-toplevel` fails or returns the CWD itself with no commits. Check for sibling repos:
+
+```bash
+for dir in */; do
+  if [ -d "$dir/.git" ]; then
+    echo "$dir"
+  fi
+done
+```
+
+If multiple subdirectories are independent git repos, **this is a multi-repo scenario** — go to Step 2.
+
+Capture and store for single-repo flow:
 - `CURRENT_BRANCH`: output of `git branch --show-current`
 - `MAIN_WORKTREE_PATH`: first path from `git worktree list`
-- `MAIN_WORKTREE_BRANCH`: branch checked out in the main worktree (from `git worktree list | head -1`, the part inside `[...]`)
-- `CURRENT_WORKTREE_PATH`: output of `git rev-parse --show-toplevel` (only relevant if in worktree context)
+- `MAIN_WORKTREE_BRANCH`: branch from `git worktree list | head -1` (the part inside `[...]`)
+- `CURRENT_WORKTREE_PATH`: output of `git rev-parse --show-toplevel` (only if worktree)
 - `IS_WORKTREE`: boolean
 
-## Step 2: Handle Uncommitted Changes
+---
+
+## Step 2: Multi-Repo Discovery (only if context is C)
+
+When invoked from a parent directory containing multiple independent git repos, the user likely has work spread across more than one of them. You need to figure out which repos are actually affected.
+
+**Discover affected repos:**
+
+```bash
+for dir in */; do
+  [ -d "$dir/.git" ] || continue
+  cd "$dir"
+  branch=$(git branch --show-current 2>/dev/null)
+  uncommitted=$(git status --short 2>/dev/null | wc -l | tr -d ' ')
+  # Check if branch is ahead of its remote counterpart
+  ahead=$(git rev-list --count @{u}..HEAD 2>/dev/null || echo "0")
+  if [ "$uncommitted" -gt 0 ] || [ "$ahead" -gt 0 ]; then
+    echo "$dir (branch: $branch, uncommitted: $uncommitted, ahead: $ahead)"
+  fi
+  cd ..
+done
+```
+
+A repo is "affected" if it has uncommitted changes **or** commits not yet pushed to origin.
+
+**Present findings to the user:**
+
+```
+I found changes in the following repos:
+
+  • api/         (branch: feat/DEV-1040, 3 commits ahead, 0 uncommitted)
+  • corporate/   (branch: feat/DEV-1040, 5 commits ahead, 0 uncommitted)
+
+I'll create a PR for each one. Proceed?
+```
+
+Wait for confirmation, then **iterate Steps 3–6 for each affected repo in sequence**, `cd`-ing into each one before starting. Keep a running list of all PR URLs created.
+
+After all repos are done, go to Step 7.
+
+---
+
+## Step 3: Handle Uncommitted Changes
+
+*(Run this per-repo when in multi-repo mode — `cd` into the repo first)*
 
 ```bash
 git status --short
@@ -51,7 +115,7 @@ git status --short
 If there are uncommitted changes, ask:
 
 ```
-There are uncommitted changes. What would you like to do?
+There are uncommitted changes in <repo>. What would you like to do?
 
 1. Commit them now (I'll write a commit message based on the changes)
 2. Stash them
@@ -66,9 +130,11 @@ Which option?
 
 If there are no uncommitted changes, continue silently.
 
-## Step 3: Verify Tests
+---
 
-Auto-detect the project's test suite and run it:
+## Step 4: Verify Tests
+
+*(Run this per-repo — auto-detect the test suite from within the repo directory)*
 
 ```bash
 # Priority order — use the first match
@@ -87,7 +153,7 @@ fi
 
 **If tests fail:**
 ```
-Tests failing before ship — cannot create PR with broken tests.
+Tests failing in <repo> — cannot create PR with broken tests.
 
 [paste failures]
 
@@ -99,20 +165,23 @@ Stop.
 
 **If tests pass:** Continue silently.
 
-## Step 4: Detect Origin Branch
+---
+
+## Step 5: Detect Origin Branch and Push PR
+
+*(Run this per-repo)*
 
 The origin branch is **where the current branch was created from** — not necessarily `main`. This is what the PR will target and where the workspace will return to.
 
-Detection strategy (run in order, use the first result that makes sense):
+**Detection strategy (run in order, use first result that makes sense):**
 
-**For worktrees** — the main worktree's branch is the strongest signal, since worktrees are almost always created from it:
+For worktrees — the main worktree's branch is the strongest signal:
 ```bash
 ORIGIN_BRANCH=$(git worktree list | head -1 | grep -oP '\[\K[^\]]+')
 ```
 
-**For regular branches** — find the local branch with the smallest number of unique commits relative to HEAD (i.e., where this branch most recently diverged from):
+For regular branches — find the local branch with the fewest unique commits ahead:
 ```bash
-# Collect candidates: common base branches + any local branch
 CANDIDATES=$(git for-each-ref --format='%(refname:short)' refs/heads/ | grep -v "^$(git branch --show-current)$")
 BEST=""
 BEST_AHEAD=999999
@@ -126,29 +195,25 @@ done
 ORIGIN_BRANCH=$BEST
 ```
 
-**Fallback** — if no local candidate found, fall back to the remote default branch:
+Fallback to remote default:
 ```bash
 if [ -z "$ORIGIN_BRANCH" ]; then
   ORIGIN_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
 fi
-
-# Last resort
 if [ -z "$ORIGIN_BRANCH" ]; then
   ORIGIN_BRANCH="main"
 fi
 ```
 
-**Confirm with the user** if uncertain:
+**Confirm with the user** if uncertain (multiple candidates with the same distance, or fallback was used):
 ```
-Detected origin branch: <ORIGIN_BRANCH> (<N> commits behind HEAD).
-Is this correct, or should I target a different branch?
+Detected origin branch for <repo>: <ORIGIN_BRANCH> (<N> commits behind HEAD).
+Is this correct?
 ```
-Only ask if confidence is low — e.g., multiple candidates with the same distance, or fallback was used.
 
-## Step 5: Push and Create PR
+**Push and create PR:**
 
 ```bash
-# Push the branch
 git push -u origin "$CURRENT_BRANCH"
 ```
 
@@ -167,14 +232,18 @@ gh pr create \
 ## Test Plan
 - [ ] <key verification steps based on what changed>
 
-🤖 Shipped via [ship skill](https://github.com/tarcisiopgs/ship)
+🤖 Shipped via [ship skill](https://github.com/tarcisiopgs/ship-skill)
 EOF
 )"
 ```
 
-Print the PR URL prominently after creation.
+Record the PR URL. In multi-repo mode, add it to the running list and move on to the next repo.
+
+---
 
 ## Step 6: Restore Original State
+
+*(Run this per-repo immediately after its PR is created)*
 
 ### If in a Worktree
 
@@ -182,7 +251,7 @@ Print the PR URL prominently after creation.
 git worktree remove "$CURRENT_WORKTREE_PATH"
 ```
 
-Since you cannot change the user's shell working directory, **always print explicit instructions** to return to the origin branch:
+Since you cannot change the user's shell working directory, **always print explicit instructions**:
 
 ```
 PR created: <URL>
@@ -203,18 +272,40 @@ git checkout "$ORIGIN_BRANCH"
 git pull
 ```
 
-Report:
+In multi-repo mode: stay in the repo directory long enough to restore, then `cd ..` back to the parent before starting the next repo.
+
+---
+
+## Step 7: Multi-Repo Summary (only if Step 2 ran)
+
+After all repos are processed, print a clean summary:
+
 ```
-PR created: <URL>
-Switched to <ORIGIN_BRANCH> and pulled latest.
+All PRs created:
+
+  • api/       → https://github.com/org/api/pull/616
+  • corporate/ → https://github.com/org/corporate/pull/284
+
+Branches restored to <ORIGIN_BRANCH> in all repos.
 ```
+
+If a stash was created in any repo during Step 3, remind the user:
+```
+Don't forget to pop your stash in <repo>:
+  cd <repo> && git stash pop
+```
+
+---
 
 ## Quick Reference
 
-| Context | After PR created |
-|---------|-----------------|
-| Worktree | `git worktree remove <path>` + instruct `cd` to main worktree + `git checkout <ORIGIN_BRANCH> && git pull` |
-| Regular branch | `git checkout <ORIGIN_BRANCH> && git pull` |
+| Context | Detection | Flow |
+|---------|-----------|------|
+| Worktree | `git worktree list` shows current path as non-first | Steps 3–6 once |
+| Regular branch | Single `.git` at CWD | Steps 3–6 once |
+| Multi-repo parent | `git rev-parse --show-toplevel` fails; subdirs have `.git` | Step 2 → Steps 3–6 per repo → Step 7 |
+
+---
 
 ## Edge Cases
 
@@ -224,25 +315,32 @@ Switched to <ORIGIN_BRANCH> and pulled latest.
 ```bash
 gh pr create ... 2>&1 | grep -q "already exists" && gh pr view --web
 ```
-In this case, just print the existing PR URL and proceed to cleanup.
+In this case, record the existing PR URL and continue to the next repo (don't stop).
 
-**Detached HEAD**: if `git branch --show-current` returns empty, stop and tell the user: "Cannot ship from detached HEAD state. Check out a named branch first."
+**Repos with different branch names**: In multi-repo mode, each repo may be on a different branch. Report the branch name per repo in the discovery step and handle each independently.
 
-**No remote configured**: if `git remote` returns nothing, stop and tell the user to configure a remote first.
+**Detached HEAD**: if `git branch --show-current` returns empty, skip that repo with a warning: "Skipping <repo> — detached HEAD state."
+
+**No remote configured**: if `git remote` returns nothing for a repo, warn and skip it.
+
+**One repo fails tests**: In multi-repo mode, stop entirely and report which repo failed. Don't ship any repo if one has broken tests — the change is probably cross-repo and partial shipping creates inconsistency.
+
+---
 
 ## Red Flags
 
 **Never:**
-- Ship with failing tests
+- Ship with failing tests (in any repo)
 - Force-push without the user explicitly asking
 - Delete uncommitted changes without confirmation
 - Assume the origin branch is always `main` — detect it properly
 - Target the wrong base on `gh pr create` (always pass `--base "$ORIGIN_BRANCH"`)
+- Ship only some repos in a multi-repo scenario without warning the user
 
 **Always:**
-- Detect worktree vs. regular branch before acting
-- Pull latest on origin branch after switching
-- Print the PR URL clearly after creation
+- Detect worktree vs. regular branch vs. multi-repo parent before acting
+- Pull latest on origin branch after switching, in every repo
+- Print each PR URL clearly after creation
 - Give explicit `cd` + `git checkout` instructions when removing a worktree — you cannot change the user's shell CWD
-- Remind the user if a stash was created during Step 2
-- Confirm the detected origin branch with the user when confidence is low
+- Remind the user if a stash was created during Step 3
+- Confirm the detected origin branch when confidence is low
