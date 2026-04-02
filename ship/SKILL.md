@@ -15,13 +15,14 @@ This skill is opinionated and streamlined: it always ships via PR and always res
 
 The full flow:
 1. Detect context (worktree, single repo, or multi-repo parent)
-2. [Multi-repo] Discover all affected sibling repos and iterate Steps 3–6 for each
+2. [Multi-repo] Discover all affected sibling repos and iterate Steps 3–7 for each
 3. Handle uncommitted changes
 4. Verify tests pass
-5. Push and create PR
-5.5. Optionally add reviewers
-6. Restore original state
-7. [Multi-repo] Summarize all PRs
+5. Push and create PR (with assignee auto-set to current user)
+6. Add reviewers (optional, excluding the current user)
+7. Monitor CI — fix failures automatically when possible, escalate when not
+8. Restore original state
+9. [Multi-repo] Summarize all PRs
 
 ---
 
@@ -38,10 +39,10 @@ git branch --show-current 2>/dev/null
 **Three possible contexts:**
 
 ### A) Worktree context
-Current path matches a non-first line in `git worktree list`. Proceed with single-repo flow (Steps 3–6) inside this worktree.
+Current path matches a non-first line in `git worktree list`. Proceed with single-repo flow (Steps 3–8) inside this worktree.
 
 ### B) Regular single-repo branch
-Current path is the main worktree path (first line of `worktree list`). Proceed with single-repo flow (Steps 3–6).
+Current path is the main worktree path (first line of `worktree list`). Proceed with single-repo flow (Steps 3–8).
 
 ### C) Multi-repo parent (no git root here, but subdirs are independent repos)
 `git rev-parse --show-toplevel` fails or returns the CWD itself with no commits. Check for sibling repos:
@@ -63,6 +64,12 @@ Capture and store for single-repo flow:
 - `CURRENT_WORKTREE_PATH`: output of `git rev-parse --show-toplevel` (only if worktree)
 - `IS_WORKTREE`: boolean
 
+Also resolve the current GitHub user now — you'll need it in Steps 5 and 6:
+
+```bash
+GITHUB_USER=$(gh api user --jq '.login' 2>/dev/null)
+```
+
 ---
 
 ## Step 2: Multi-Repo Discovery (only if context is C)
@@ -77,7 +84,6 @@ for dir in */; do
   cd "$dir"
   branch=$(git branch --show-current 2>/dev/null)
   uncommitted=$(git status --short 2>/dev/null | wc -l | tr -d ' ')
-  # Check if branch is ahead of its remote counterpart
   ahead=$(git rev-list --count @{u}..HEAD 2>/dev/null || echo "0")
   if [ "$uncommitted" -gt 0 ] || [ "$ahead" -gt 0 ]; then
     echo "$dir (branch: $branch, uncommitted: $uncommitted, ahead: $ahead)"
@@ -99,9 +105,9 @@ I found changes in the following repos:
 I'll create a PR for each one. Proceed?
 ```
 
-Wait for confirmation, then **iterate Steps 3–6 for each affected repo in sequence**, `cd`-ing into each one before starting. Keep a running list of all PR URLs created.
+Wait for confirmation, then **iterate Steps 3–8 for each affected repo in sequence**, `cd`-ing into each one before starting. Keep a running list of all PR URLs created.
 
-After all repos are done, go to Step 7.
+After all repos are done, go to Step 9.
 
 ---
 
@@ -139,7 +145,9 @@ If there are no uncommitted changes, continue silently.
 
 ```bash
 # Priority order — use the first match
-if [ -f "bun.lockb" ] || grep -q '"test"' package.json 2>/dev/null; then
+if [ -f "yarn.lock" ] && grep -q '"test"' package.json 2>/dev/null; then
+  yarn test --run
+elif [ -f "bun.lockb" ] || grep -q '"test"' package.json 2>/dev/null; then
   bun test
 elif [ -f "package.json" ]; then
   npm test
@@ -168,7 +176,7 @@ Stop.
 
 ---
 
-## Step 5: Detect Origin Branch and Push PR
+## Step 5: Detect Origin Branch, Push, and Create PR
 
 *(Run this per-repo)*
 
@@ -212,20 +220,24 @@ Detected origin branch for <repo>: <ORIGIN_BRANCH> (<N> commits behind HEAD).
 Is this correct?
 ```
 
-**Push and create PR:**
-
+**Push:**
 ```bash
 git push -u origin "$CURRENT_BRANCH"
 ```
+
+**Create the PR — always assign to the current user.**
+
+Setting the current user as assignee is important because it makes ownership clear in GitHub: who shipped this feature. You already resolved `GITHUB_USER` in Step 1.
 
 Build the PR title from the branch name: strip common prefixes (`feat/`, `fix/`, `feature/`, `chore/`, `refactor/`, `hotfix/`), replace hyphens with spaces, capitalize. Cross-reference with recent commits to make it human-readable.
 
 Build the PR body from `git log $ORIGIN_BRANCH..HEAD` and `git diff $ORIGIN_BRANCH...HEAD --stat`:
 
 ```bash
-gh pr create \
+PR_URL=$(gh pr create \
   --title "<derived title>" \
   --base "$ORIGIN_BRANCH" \
+  --assignee "$GITHUB_USER" \
   --body "$(cat <<'EOF'
 ## Summary
 <2-3 bullets summarizing what changed, derived from commits and diff>
@@ -235,14 +247,14 @@ gh pr create \
 
 🤖 Shipped via [ship skill](https://github.com/tarcisiopgs/ship-skill)
 EOF
-)"
+)")
 ```
 
 Record the PR URL. In multi-repo mode, add it to the running list and move on to the next repo.
 
 ---
 
-## Step 5.5: Add Reviewers (optional)
+## Step 6: Add Reviewers (optional)
 
 After the PR is created, ask the user if they want to add reviewers:
 
@@ -254,10 +266,10 @@ Would you like to add reviewers? (yes/no)
 
 **If yes:**
 
-Fetch the repository's contributors via GitHub CLI:
+Fetch the repository's contributors, excluding yourself (since you're already the assignee, adding yourself as reviewer is redundant and GitHub won't allow it anyway):
 
 ```bash
-gh api repos/{owner}/{repo}/contributors --jq '.[].login' 2>/dev/null | head -20
+gh api repos/{owner}/{repo}/contributors --jq '.[].login' 2>/dev/null | grep -v "^$GITHUB_USER$" | head -20
 ```
 
 Extract `{owner}` and `{repo}` from the remote URL:
@@ -273,7 +285,6 @@ Available contributors:
   1. alice
   2. bob
   3. carol
-  4. dave
 
 Who should review this PR? (enter names or numbers, comma-separated)
 ```
@@ -286,15 +297,86 @@ gh pr edit "<PR_URL>" --add-reviewer "alice,bob"
 
 Confirm: "Reviewers added: alice, bob"
 
-**If no (or no answer within context):** Skip silently and proceed to Step 6.
+**If no (or no answer within context):** Skip silently and proceed to Step 7.
 
 In multi-repo mode: ask about reviewers per repo, immediately after each PR is created.
 
 ---
 
-## Step 6: Restore Original State
+## Step 7: Monitor CI
 
-*(Run this per-repo immediately after its PR is created)*
+After the PR is created, check whether CI exists for this repository. CI runs give you a feedback loop that closes the loop on "did this actually work?" — don't skip monitoring if CI is present.
+
+**Check for CI:**
+```bash
+gh pr checks "$PR_URL" 2>/dev/null
+```
+
+If the output is empty or returns "no checks", there is no CI configured — skip this step and continue to Step 8.
+
+If CI checks exist, enter the monitoring loop:
+
+### Monitoring loop
+
+```bash
+# Poll until all checks finish (pass or fail)
+gh pr checks "$PR_URL" --watch 2>/dev/null
+```
+
+**If all checks pass:** Report success and proceed to Step 8.
+
+**If checks fail:** Read the failure details:
+
+```bash
+gh run list --branch "$CURRENT_BRANCH" --limit 5 --json databaseId,name,status,conclusion 2>/dev/null
+# For each failed run, get the logs:
+gh run view <run_id> --log-failed 2>/dev/null
+```
+
+Then decide: **can this be fixed automatically?**
+
+A failure is fixable if it's one of these:
+- Lint or formatting errors (run the linter/formatter, commit, push)
+- Type errors introduced by the changes (fix the types, commit, push)
+- Test failures caused by a mock not being updated for a new hook or export (update the mock, commit, push)
+- Missing i18n keys referenced in the code (add the key, commit, push)
+
+A failure is **not fixable** without the user if it involves:
+- Flaky infrastructure (network timeouts, third-party services)
+- Secrets or environment variables missing from CI
+- Failures in tests completely unrelated to the current changes
+- Logic errors that require product judgment to resolve
+- Any failure where you've already attempted a fix and it failed again
+
+**When fixing:**
+1. Apply the fix
+2. Commit with a clear message (e.g., `fix: resolve CI lint errors`)
+3. Push to the same branch
+4. Re-enter the monitoring loop — wait for the new run to complete
+
+**Loop limit:** After 3 fix attempts, stop even if the cause seems fixable. Repeating the same fix approach without progress is a signal that something deeper is wrong.
+
+**When escalating to the user:**
+
+```
+CI is failing and I wasn't able to fix it automatically.
+
+Failing checks:
+  • <check name> — <brief description of error>
+
+Relevant logs:
+<paste the most relevant failure output, trimmed to what matters>
+
+What would you like to do?
+```
+
+Wait for the user's instructions before proceeding.
+
+---
+
+## Step 8: Restore Original State
+
+*(Run this per-repo immediately after CI passes or the user resolves the failure)*
 
 ### If in a Worktree
 
@@ -305,8 +387,6 @@ git worktree remove "$CURRENT_WORKTREE_PATH"
 Since you cannot change the user's shell working directory, **always print explicit instructions**:
 
 ```
-PR created: <URL>
-
 Worktree removed. Return to your origin branch:
 
   cd <MAIN_WORKTREE_PATH>
@@ -327,7 +407,7 @@ In multi-repo mode: stay in the repo directory long enough to restore, then `cd 
 
 ---
 
-## Step 7: Multi-Repo Summary (only if Step 2 ran)
+## Step 9: Multi-Repo Summary (only if Step 2 ran)
 
 After all repos are processed, print a clean summary:
 
@@ -352,9 +432,9 @@ Don't forget to pop your stash in <repo>:
 
 | Context | Detection | Flow |
 |---------|-----------|------|
-| Worktree | `git worktree list` shows current path as non-first | Steps 3–6 once |
-| Regular branch | Single `.git` at CWD | Steps 3–6 once |
-| Multi-repo parent | `git rev-parse --show-toplevel` fails; subdirs have `.git` | Step 2 → Steps 3–6 per repo → Step 7 |
+| Worktree | `git worktree list` shows current path as non-first | Steps 3–8 once |
+| Regular branch | Single `.git` at CWD | Steps 3–8 once |
+| Multi-repo parent | `git rev-parse --show-toplevel` fails; subdirs have `.git` | Step 2 → Steps 3–8 per repo → Step 9 |
 
 ---
 
@@ -364,9 +444,14 @@ Don't forget to pop your stash in <repo>:
 
 **PR already exists for this branch**: `gh pr create` will error. Catch it:
 ```bash
-gh pr create ... 2>&1 | grep -q "already exists" && gh pr view --web
+PR_OUTPUT=$(gh pr create ... 2>&1)
+if echo "$PR_OUTPUT" | grep -q "already exists"; then
+  PR_URL=$(gh pr view --json url --jq '.url')
+else
+  PR_URL="$PR_OUTPUT"
+fi
 ```
-In this case, record the existing PR URL and continue to the next repo (don't stop).
+Record the existing PR URL and continue.
 
 **Repos with different branch names**: In multi-repo mode, each repo may be on a different branch. Report the branch name per repo in the discovery step and handle each independently.
 
@@ -376,22 +461,21 @@ In this case, record the existing PR URL and continue to the next repo (don't st
 
 **One repo fails tests**: In multi-repo mode, stop entirely and report which repo failed. Don't ship any repo if one has broken tests — the change is probably cross-repo and partial shipping creates inconsistency.
 
+**CI flapping**: if a check fails on the first run but passes on the second without any code change, it was flaky infrastructure. Note it to the user but don't treat it as a blocker.
+
 ---
 
 ## Red Flags
 
-**Never:**
-- Ship with failing tests (in any repo)
-- Force-push without the user explicitly asking
-- Delete uncommitted changes without confirmation
-- Assume the origin branch is always `main` — detect it properly
-- Target the wrong base on `gh pr create` (always pass `--base "$ORIGIN_BRANCH"`)
-- Ship only some repos in a multi-repo scenario without warning the user
-
-**Always:**
+- Don't ship with failing tests (in any repo)
+- Don't force-push without the user explicitly asking
+- Don't delete uncommitted changes without confirmation
+- Don't assume the origin branch is always `main` — detect it properly
+- Don't target the wrong base on `gh pr create` (always pass `--base "$ORIGIN_BRANCH"`)
+- Don't ship only some repos in a multi-repo scenario without warning the user
+- Don't keep attempting the same CI fix if it didn't work the first time — escalate instead
 - Detect worktree vs. regular branch vs. multi-repo parent before acting
 - Pull latest on origin branch after switching, in every repo
 - Print each PR URL clearly after creation
 - Give explicit `cd` + `git checkout` instructions when removing a worktree — you cannot change the user's shell CWD
 - Remind the user if a stash was created during Step 3
-- Confirm the detected origin branch when confidence is low
