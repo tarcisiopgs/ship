@@ -19,6 +19,7 @@ The full flow:
 3. Handle uncommitted changes
 4. Verify tests pass
 5. Push and create PR
+5.5. Optionally add reviewers
 6. Restore original state
 7. [Multi-repo] Summarize all PRs
 
@@ -238,6 +239,56 @@ EOF
 ```
 
 Record the PR URL. In multi-repo mode, add it to the running list and move on to the next repo.
+
+---
+
+## Step 5.5: Add Reviewers (optional)
+
+After the PR is created, ask the user if they want to add reviewers:
+
+```
+PR created: <URL>
+
+Would you like to add reviewers? (yes/no)
+```
+
+**If yes:**
+
+Fetch the repository's contributors via GitHub CLI:
+
+```bash
+gh api repos/{owner}/{repo}/contributors --jq '.[].login' 2>/dev/null | head -20
+```
+
+Extract `{owner}` and `{repo}` from the remote URL:
+```bash
+git remote get-url origin | sed 's/.*github.com[:/]\(.*\)\.git/\1/' | awk -F'/' '{print $1, $2}'
+```
+
+Present the contributors as a numbered list:
+
+```
+Available contributors:
+
+  1. alice
+  2. bob
+  3. carol
+  4. dave
+
+Who should review this PR? (enter names or numbers, comma-separated)
+```
+
+Wait for the user's answer, then add the reviewers:
+
+```bash
+gh pr edit "<PR_URL>" --add-reviewer "alice,bob"
+```
+
+Confirm: "Reviewers added: alice, bob"
+
+**If no (or no answer within context):** Skip silently and proceed to Step 6.
+
+In multi-repo mode: ask about reviewers per repo, immediately after each PR is created.
 
 ---
 
